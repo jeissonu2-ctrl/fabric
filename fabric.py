@@ -9,16 +9,28 @@ def main(data):
     print("Iniciando ejecución de Orden_de_fabricacion.py")
  
     # Definir los valores de la conexión
-    url = 'https://*****/'
-    db = 'basededatos'
+    url = 'https://odoo-qa.thomasgreg.com/' #'https://odoo-test1.thomasgreg.com/'
+    db = 'portalerp' #'db_cost' 
+
     username = data.get("usuario")
     password = data.get("password")
-    context = {'allow_none': True, 'verbose': False, 'use_datetime':True, 'context': ssl._create_unverified_context()}
-    
-    # Conexión con Odoo con allow_none activado
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
+    #context = {'allow_none': True, 'verbose': False, 'use_datetime':True, 'context': ssl._create_unverified_context()}
+    ssl_context = ssl._create_unverified_context()
+    common = xmlrpc.client.ServerProxy(
+        f"{url}/xmlrpc/2/common",
+        allow_none=True,
+        use_datetime=True,
+        context=ssl_context
+    )
+    models = xmlrpc.client.ServerProxy(
+        f"{url}/xmlrpc/2/object",
+        allow_none=True,
+        use_datetime=True,
+        context=ssl_context
+    )
+    #common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", **context)
     uid = common.authenticate(db, username, password, {})
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
+    #models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", **context)
 
     encabezado = data["Encabezado"]
     lineas = data.get("Backorders", [])
@@ -115,6 +127,335 @@ def main(data):
         return PlantillaDeProducto, product_id, tracking_info, order_type_ids, datos
     PlantillaDeProducto, product_id, tracking_info, order_type_ids, datos = producto()
 
+    def obtener_secuencia_desde_bom(bom_id, company_id):
+       #Obtiene la secuencia correcta desde el BOM y su producto
+        try:
+            # Obtener el BOM completo
+            bom = models.execute_kw(db, uid, password, 'mrp.bom', 'read',
+                [[bom_id]], {'fields': ['picking_type_id']}
+            )
+            
+            if not bom:
+                return None
+                
+            picking_type_id = bom[0].get('picking_type_id')
+
+            if not picking_type_id:
+                print("No se pudo obtener picking_type_id del BOM")
+                return None
+                
+            # Obtener el stock.picking.type
+            picking_type = models.execute_kw(db, uid, password, 'stock.picking.type', 'read',
+                [[picking_type_id[0]]], {'fields': ['sequence_id', 'sequence_code']}
+            )
+            
+            if not picking_type or not picking_type[0].get('sequence_id'):
+                print("Picking type no tiene sequence_id")
+                return None
+                
+            sequence_id = picking_type[0]['sequence_id'][0]
+            
+            # Obtener la secuencia completa
+            sequence = models.execute_kw(db, uid, password, 'ir.sequence', 'read',
+                [[sequence_id]], {'fields': ['id', 'name', 'code', 'prefix', 'padding', 'number_next_actual']}
+            )
+            
+            return sequence[0] if sequence else None
+                
+        except Exception as e:
+            print(f"Error obteniendo secuencia desde BOM: {e}")
+            return None
+
+    def obtener_bom_desde_producto(product_code, company_id, version_bom=1):
+        #Obtener el BOM basado en el producto
+        try:
+            # Primero obtener el ID del producto desde su default_code
+            producto = models.execute_kw(db, uid, password, 'product.product', 'search_read',
+                [[['default_code', '=', product_code], ['company_id', '=', company_id]]],
+                {'fields': ['id'], 'limit': 1}
+            )
+            
+            if not producto:
+                raise Exception(f"Producto no encontrado: {product_code}")
+                
+            product_id = producto[0]['id']
+            
+            # Buscar BOM que coincida con producto y versión
+            bom = models.execute_kw(db, uid, password, 'mrp.bom', 'search_read',
+                [[
+                    ('product_id', '=', product_id),
+                    ('version', '=', int(version_bom)),
+                    ('company_id', '=', company_id)
+                ]],
+                {'fields': ['id', 'picking_type_id', 'code'], 'limit': 1}
+            )
+            
+            if not bom:
+                # Intentar sin versión específica
+                bom = models.execute_kw(db, uid, password, 'mrp.bom', 'search_read',
+                    [[
+                        ('product_id', '=', product_id),
+                        ('company_id', '=', company_id)
+                    ]],
+                    {'fields': ['id', 'picking_type_id', 'code'], 'limit': 1}
+                )
+                
+            if bom:
+                print(f"BOM encontrado: {bom[0]['code']}")
+                return bom[0]
+            else:
+                print(" No se encontró BOM para el producto")
+                return None
+                
+        except Exception as e:
+            print(f"Error obteniendo BOM: {e}")
+            return None
+
+    def obtener_proximo_numero_secuencia(sequence_id, sequence_code):
+        #Obtiene el próximo número de la secuencia y actualiza el contador
+        try:
+            # Obtener el próximo número
+            next_number = models.execute_kw(db, uid, password, 'ir.sequence', 'next_by_id',
+                [sequence_id]
+            )
+            
+            # Si next_by_id no funciona, usar next_by_code
+            if not next_number:
+                next_number = models.execute_kw(db, uid, password, 'ir.sequence', 'next_by_code',
+                    [sequence_code]
+                )
+            
+            print(f"Próximo número de secuencia: {next_number}")
+            return next_number
+            
+        except Exception as e:
+            print(f"Error obteniendo próximo número: {e}")
+            return None
+        
+    def obtener_id_compania(company_ids):
+        if isinstance(company_ids, list) and len(company_ids) > 0:
+            return company_ids[0]  # Si es lista, devuelve el primer elemento
+        elif isinstance(company_ids, int):
+            return company_ids  # Si ya es entero, lo devuelve directamente
+        else:
+            # Valor por defecto o error según tu caso
+            return company_ids[0] if isinstance(company_ids, list) else company_ids    
+    #Aca empece cambios ctrol Z
+
+    def finalizar_produccion_completa(production_id, company_ids, cantidad_fabricar, Cantidad_total, nombre_produccion):
+        #Función común para finalizar producción (usar en principal y backorders)
+        try:
+            print(f"Finalizando producción {nombre_produccion} con método completo...")
+            
+            # 1. Desactivar validación de stock negativo
+            config_param = models.execute_kw(
+                db, uid, password, 'ir.config_parameter', 'search_read',
+                [[['key', '=', 'stock.no_negative']]],
+                {'fields': ['id', 'value']}
+            )
+            if config_param:
+                models.execute_kw(
+                    db, uid, password, 'ir.config_parameter', 'write',
+                    [[config_param[0]['id']], {'value': 'False'}]
+                )
+
+            # 2. Método alternativo para forzar moves
+            production = models.execute_kw(
+                db, uid, password, 'mrp.production', 'read',
+                [[production_id]], {'fields': ['name', 'state', 'move_raw_ids']}
+            )[0]
+            
+            moves_info = models.execute_kw(
+                db, uid, password, 'stock.move', 'search_read',
+                [[['id', 'in', production['move_raw_ids']]]],
+                {'fields': ['id', 'product_id', 'product_uom_qty', 'name']}
+            )
+            
+            for move in moves_info:
+                cantidad_move = move['product_uom_qty']
+                models.execute_kw(
+                    db, uid, password, 'stock.move', 'write',
+                    [[move['id']], {
+                        'state': 'done',
+                        'quantity_done': cantidad_move 
+                    }]
+                )
+                print(f"Move {move['id']} forzado a 'done' (Cantidad: {cantidad_move})")
+            
+            # 3. Marcar producción como done
+            models.execute_kw(
+                db, uid, password, 'mrp.production', 'write',
+                [[production_id], {
+                    'state': 'done',
+                    'qty_producing': cantidad_fabricar,
+                    'product_qty': Cantidad_total
+                }]
+            )
+            print("Producción forzada a estado 'done'")
+
+            # 4.  Actualización de stock.quant
+            print("=== ACTUALIZANDO STOCK.QUANT ===")
+            moves_con_lotes = models.execute_kw(
+                db, uid, password, 'stock.move', 'search_read',
+                [[
+                    ['raw_material_production_id', '=', production_id],
+                    ['needs_lots', '=', True]  
+                ]],
+                {'fields': ['id', 'product_id', 'location_id', 'location_dest_id']}
+            )
+            
+            for move in moves_con_lotes:
+                move_lines = models.execute_kw(
+                    db, uid, password, 'stock.move.line', 'search_read',
+                    [[
+                        ['move_id', '=', move['id']],
+                        ['qty_done', '>', 0]  
+                    ]],
+                    {'fields': ['id', 'location_id', 'location_dest_id', 'lot_id', 'qty_done', 'product_id']}
+                )
+                
+                if move_lines:
+                    for ml in move_lines:
+                        cantidad_consumida = ml['qty_done']
+                        product_id = ml['product_id'][0]
+                        
+                        if ml['lot_id']:
+                            # Actualizar almacen de origen
+                            domain_origen = [
+                                ['product_id', '=', product_id],
+                                ['location_id', '=', ml['location_id'][0]],
+                                ['lot_id', '=', ml['lot_id'][0]]
+                            ]
+                            
+                            quants_origen = models.execute_kw(
+                                db, uid, password, 'stock.quant', 'search_read',
+                                [domain_origen],
+                                {'fields': ['id', 'quantity']}
+                            )
+                            
+                            if quants_origen:
+                                quant_origen = quants_origen[0]
+                                nuevo_stock_origen = max(0, quant_origen['quantity'] - cantidad_consumida)
+                                
+                                models.execute_kw(
+                                    db, uid, password, 'stock.quant', 'write',
+                                    [[quant_origen['id']], {
+                                        'quantity': nuevo_stock_origen
+                                    }]
+                                )
+                            
+                            # Actualizar almacen de destino
+                            domain_destino = [
+                                ['product_id', '=', product_id],
+                                ['location_id', '=', ml['location_dest_id'][0]],
+                                ['lot_id', '=', ml['lot_id'][0]]
+                            ]
+                            
+                            quants_destino = models.execute_kw(
+                                db, uid, password, 'stock.quant', 'search_read',
+                                [domain_destino],
+                                {'fields': ['id', 'quantity']}
+                            )
+                            
+                            if quants_destino:
+                                quant_destino = quants_destino[0]
+                                nuevo_stock_destino = quant_destino['quantity'] + cantidad_consumida
+                                
+                                models.execute_kw(
+                                    db, uid, password, 'stock.quant', 'write',
+                                    [[quant_destino['id']], {
+                                        'quantity': nuevo_stock_destino
+                                    }]
+                                )
+                            else:
+                                # Crear nuevo quant en destino
+                                quant_data = {
+                                    'product_id': product_id,
+                                    'location_id': ml['location_dest_id'][0],
+                                    'lot_id': ml['lot_id'][0],
+                                    'quantity': cantidad_consumida,
+                                    'company_id': obtener_id_compania(company_ids)
+                                }
+                                
+                                models.execute_kw(
+                                    db, uid, password, 'stock.quant', 'create',
+                                    [quant_data]
+                                )
+
+            # 5. Reactivar validación
+            if config_param:
+                models.execute_kw(
+                    db, uid, password, 'ir.config_parameter', 'write',
+                    [[config_param[0]['id']], {'value': 'True'}]
+                )
+
+            # 6. Ejecutar button_mark_done por si acaso
+            try:
+                models.execute_kw(
+                    db, uid, password, 'mrp.production', 'button_mark_done',
+                    [[production_id]]
+                )
+            except:
+                pass  # Ignorar si falla, ya la forzamos a done
+
+            print(f"Producción {nombre_produccion} finalizada correctamente")
+            
+        except Exception as e:
+            print(f"Error en finalizar_produccion_completa: {e}")
+            raise
+
+    # Obtener el producto desde el encabezado
+    product_code = encabezado.get("Producto")
+    version_bom = encabezado.get("Campo Nuevo", 1)
+
+    # Obtener el BOM correcto para este producto
+    bom = obtener_bom_desde_producto(product_code, company_ids[0], version_bom)
+
+    if bom:
+        # Obtener la secuencia desde el BOM
+        secuencia_info = obtener_secuencia_desde_bom(bom['id'], company_ids[0])
+        
+        if secuencia_info:
+            numero_formateado = obtener_proximo_numero_secuencia(
+                secuencia_info['id'], 
+                secuencia_info['code']
+            )
+            datos['name'] = numero_formateado
+            print(f"Usando secuencia del BOM: {numero_formateado}")
+        else:
+            print("Usando secuencia por defecto (no se encontró en BOM)")
+            datos['name'] = '/'
+    else:
+        print("Usando secuencia por defecto (no se encontró BOM)")
+        datos['name'] = '/'
+
+    def validar_stock_suficiente(product_id, lot_id, cantidad_requerida, location_id):
+        #Valida que haya stock suficiente antes de procesar la orden
+        domain = [
+            ['product_id', '=', product_id],
+            ['location_id', '=', location_id],
+            ['quantity', '>', 0]
+        ]
+        
+        if lot_id and lot_id is not False:
+            domain.append(['lot_id', '=', lot_id])
+        else:
+            domain.append(['lot_id', '=', False])
+        
+        stock_disponible = models.execute_kw(db, uid, password, 'stock.quant', 'search_read',
+            [domain], {'fields': ['quantity', 'lot_id']}
+        )
+        
+        total_stock = sum([q['quantity'] for q in stock_disponible])
+        
+        print(f"Validación stock: Producto {product_id}, Lote {lot_id}")
+        print(f" Stock disponible: {total_stock}, Requerido: {cantidad_requerida}")
+        
+        if total_stock < cantidad_requerida:
+            raise Exception(f"STOCK INSUFICIENTE: Se requieren {cantidad_requerida} unidades, pero solo hay {total_stock} disponibles")
+        
+        return True    
+    
     # Crear orden de fabricación
     id = models.execute_kw(
         db, uid, password, 'mrp.production', 'create', [datos]
@@ -298,15 +639,7 @@ def main(data):
                 {'fields': ['id', 'product_uom_qty', 'qty_done']}
             )
 
-            for ml in move_lines:
-                models.execute_kw(
-                    db, uid, password,
-                    'stock.move.line', 'write',
-                    [[ml['id']], {
-                        'qty_done': ml['product_uom_qty']
-                    }]
-                )
-
+            # num_lotes
             num_lotes = int(1)
             for i in range(num_lotes):
                 lote_componente = lineas[0]["Lote a Consumir"]
@@ -316,18 +649,12 @@ def main(data):
                     {'fields': ['id']}
                 )
                 if not lote_componente_id:
-                    raise Exception(f"No se encontró el lote '{lote_componente}'")
+                    raise Exception(f" LOTE NO EXISTE: No se encontró el lote '{lote_componente}'")
+                
                 lot_id = lote_componente_id[0]['id']
-                quant = models.execute_kw(
-                    db, uid, password, 'stock.quant', 'search_read',
-                    [[('product_id', '=', product_id), ('lot_id', '=', lot_id), ('quantity', '>', 0)]],
-                    {'fields': ['location_id']}
-                )
-                if not quant:
-                    raise Exception(f"No hay stock disponible para el lote '{lote_componente}' del producto {product_id}")
                 location_id = move['location_id'][0]
-
-                # Usar move_cantidad_real
+                cantidad_del_excel = float(lineas[0]['Cant. a Consumir'])
+                validar_stock_suficiente(product_id, lot_id, cantidad_del_excel, location_id)  
                 ml_creado = models.execute_kw(
                     db, uid, password, 'stock.move.line', 'create',
                     [{
@@ -335,27 +662,28 @@ def main(data):
                         'product_id': product_id,
                         'lot_id': lot_id,
                         'lot_name': lote_componente,
-                        'product_uom_qty': move_cantidad_real,  
-                        'qty_done': move_cantidad_real,         
+                        'product_uom_qty': cantidad_del_excel,  
+                        'qty_done': cantidad_del_excel,         
                         'location_id': location_id,
                         'location_dest_id': location_dest
                     }]
-                )                
-        else:
+                )
+
             # Para productos sin lotes
-            models.execute_kw(
-                db, uid, password,
-                'stock.move.line', 'create',
-                [{
-                    'move_id': move['id'],
-                    'product_id': move['product_id'][0],
-                    'location_id': move['location_id'][0],
-                    'location_dest_id': move['location_dest_id'][0],
-                    'product_uom_qty': move_cantidad_real,  
-                    'qty_done': move_cantidad_real,         
-                    'company_id': company_ids[0],
-                }]
-            )
+            else:
+                models.execute_kw(
+                    db, uid, password,
+                    'stock.move.line', 'create',
+                    [{
+                        'move_id': move['id'],
+                        'product_id': move['product_id'][0],
+                        'location_id': move['location_id'][0],
+                        'location_dest_id': move['location_dest_id'][0],
+                        'product_uom_qty': cantidad_del_excel,  
+                        'qty_done': cantidad_del_excel,         
+                        'company_id': company_ids[0],
+                    }]
+                )
 
         #  Sobre escribir con cantidades con valores reales
     #print("=== SOBREESCRIBIENDO CANTIDADES CON VALORES REALES ===")
@@ -1111,10 +1439,7 @@ def main(data):
     # ============ ejecutar button_mark_done ============
     #print("=== EJECUTANDO button_mark_done CON STOCK ASEGURADO ===")
     try:
-        id_cerrar_op = models.execute_kw(
-            db, uid, password, 'mrp.production', 'button_mark_done',
-            [[id]]
-        )
+        finalizar_produccion_completa(id, company_ids, cantidad_fabricar, Cantidad, nombre)
         #print(" button_mark_done ejecutado exitosamente")
     except Exception as e:
         print(f" Error en button_mark_done: {e}")
@@ -1124,52 +1449,7 @@ def main(data):
             [[id], {'state': 'done'}]
         )
         #print(" Producción forzada a estado 'done'")
-        
-        print("=== LIBERANDO REMANENTE ===")
-        # Buscar todos los moves de materia prima de la producción
-        all_moves = models.execute_kw(
-            db, uid, password, 'stock.move', 'search_read',
-            [[['raw_material_production_id', '=', id]]],
-            {'fields': ['id', 'product_id']}
-        )
 
-        for move in all_moves:
-            # Buscar las move lines de cada move
-            move_lines = models.execute_kw(
-                db, uid, password, 'stock.move.line', 'search_read',
-                [[['move_id', '=', move['id']]]],
-                {'fields': ['id', 'location_id', 'product_id', 'lot_id', 'qty_done']}
-            )
-            
-            for ml in move_lines:
-                if ml['lot_id']:  
-                    print(f"Procesando lote: {ml['lot_id'][1]}")
-                    
-                    # Buscar quants con reserva para este producto+lote+ubicación
-                    domain = [
-                        ['product_id', '=', ml['product_id'][0]],
-                        ['location_id', '=', ml['location_id'][0]],
-                        ['lot_id', '=', ml['lot_id'][0]],
-                        ['reserved_quantity', '>', 0]  # Solo los que tengan reserva
-                    ]
-                    
-                    reserved_quants = models.execute_kw(
-                        db, uid, password, 'stock.quant', 'search_read',
-                        [domain],
-                        {'fields': ['id', 'quantity', 'reserved_quantity']}
-                    )
-                    
-                    # Liberar toda la reserva de estos quants
-                    for quant in reserved_quants:
-                        print(f"  Quant {quant['id']}: {quant['reserved_quantity']} unidades reservadas")
-                        
-                        models.execute_kw(
-                            db, uid, password, 'stock.quant', 'write',
-                            [[quant['id']], {'reserved_quantity': 0}]
-                        )
-                        print(f" Reserva liberada: {quant['reserved_quantity']} unidades")
-
-        print("Todas las reservas fantasma liberadas")
         # reactivar la validación de stock (tu código existente)
         if config_param:
             models.execute_kw(
@@ -1190,45 +1470,6 @@ def main(data):
             )
             #print(" Validación de stock negativo desactivada temporalmente")
 
-        print("=== LIBERANDO RESERVAS BLOQUEADAS ===")
-        moves_info = models.execute_kw(
-            db, uid, password, 'stock.move', 'search_read',
-            [[['raw_material_production_id', '=', id]]],
-            {'fields': ['id', 'product_id', 'product_uom_qty', 'state']}
-        )
-
-        for move in moves_info:
-            print(f"Procesando move ID: {move['id']}, Producto: {move['product_id'][1]}")           
-            move_lines = models.execute_kw(
-                db, uid, password, 'stock.move.line', 'search_read',
-                [[['move_id', '=', move['id']]]],
-                {'fields': ['id', 'location_id', 'lot_id', 'qty_done', 'product_id']}
-            )
-            
-            for ml in move_lines:
-                # liberar reservas de los quants
-                domain = [
-                    ['product_id', '=', ml['product_id'][0]],
-                    ['location_id', '=', ml['location_id'][0]],
-                    ['reserved_quantity', '>', 0]  
-                ]
-                
-                if ml['lot_id']:
-                    domain.append(['lot_id', '=', ml['lot_id'][0]])                
-                reserved_quants = models.execute_kw(
-                    db, uid, password, 'stock.quant', 'search_read',
-                    [domain],
-                    {'fields': ['id', 'reserved_quantity']}
-                )
-                
-                for quant in reserved_quants:
-                    # Liberar la reserva estableciendo reserved_quantity = 0
-                    models.execute_kw(
-                        db, uid, password, 'stock.quant', 'write',
-                        [[quant['id']], {'reserved_quantity': 0}]
-                    )
-                    print(f"Reserva liberada en quant {quant['id']}")
-
         # Verificar estado final
         final_state = models.execute_kw(
             db, uid, password, 'mrp.production', 'read',
@@ -1240,260 +1481,8 @@ def main(data):
         print(f"Error en button_mark_done: {e}")
         raise
 
-    #print("=== ACTUALIZANDO STOCK.QUANT PARA TODOS LOS PRODUCTOS CON LOTE ===")
-    #Buscar TODOS los moves de materia prima que usen lotes
-    moves_con_lotes = models.execute_kw(
-        db, uid, password, 'stock.move', 'search_read',
-        [[
-            ['raw_material_production_id', '=', id],
-            ['needs_lots', '=', True]  
-        ]],
-        {'fields': ['id', 'product_id', 'location_id', 'location_dest_id']}
-    )
-    #print(f"Encontrados {len(moves_con_lotes)} moves con lotes")
-
-    for move in moves_con_lotes:
-        #print(f" Procesando move {move['id']} - Producto: {move['product_id'][1]}")       
-        # Buscar la move line ejecutada (que tenga cantidad > 0)
-        move_lines = models.execute_kw(
-            db, uid, password, 'stock.move.line', 'search_read',
-            [[
-                ['move_id', '=', move['id']],
-                ['qty_done', '>', 0]  
-            ]],
-            {'fields': ['id', 'location_id', 'location_dest_id', 'lot_id', 'qty_done', 'product_id']}
-        )
-        
-        if move_lines:
-            for ml in move_lines:
-                cantidad_consumida = ml['qty_done']
-                product_id = ml['product_id'][0]
-                product_name = ml['product_id'][1]
-                
-                #print(f" Producto: {product_name}")
-                #print(f" Cantidad: {cantidad_consumida}")
-                #print(f" De: {ml['location_id'][1]} → A: {ml['location_dest_id'][1]}")
-                
-                if ml['lot_id']:
-                    print(f" Lote: {ml['lot_id'][1]}")
-                    
-                    # Actualizar almacen de origen
-                    domain_origen = [
-                        ['product_id', '=', product_id],
-                        ['location_id', '=', ml['location_id'][0]],
-                        ['lot_id', '=', ml['lot_id'][0]]
-                    ]
-                    
-                    quants_origen = models.execute_kw(
-                        db, uid, password, 'stock.quant', 'search_read',
-                        [domain_origen],
-                        {'fields': ['id', 'quantity', 'reserved_quantity']}
-                    )
-                    
-                    if quants_origen:
-                        quant_origen = quants_origen[0]
-                        nuevo_stock_origen = max(0,quant_origen['quantity'] - cantidad_consumida)
-                        
-                        models.execute_kw(
-                            db, uid, password, 'stock.quant', 'write',
-                            [[quant_origen['id']], {
-                                'quantity': max(0, nuevo_stock_origen),
-                                'reserved_quantity': 0
-                            }]
-                        )
-                        print(f" Origen: {quant_origen['quantity']} -> {nuevo_stock_origen}")
-                    else:
-                        print(" No se encontró quant en origen")
-                    
-                    # 4. Actualizar almacen de destino
-                    domain_destino = [
-                        ['product_id', '=', product_id],
-                        ['location_id', '=', ml['location_dest_id'][0]],
-                        ['lot_id', '=', ml['lot_id'][0]]
-                    ]
-                    
-                    quants_destino = models.execute_kw(
-                        db, uid, password, 'stock.quant', 'search_read',
-                        [domain_destino],
-                        {'fields': ['id', 'quantity']}
-                    )
-                    
-                    if quants_destino:
-                        # Quant ya existe en destino - aumentar
-                        quant_destino = quants_destino[0]
-                        nuevo_stock_destino = quant_destino['quantity'] + cantidad_consumida
-                        
-                        models.execute_kw(
-                            db, uid, password, 'stock.quant', 'write',
-                            [[quant_destino['id']], {
-                                'quantity': nuevo_stock_destino
-                            }]
-                        )
-                        print(f" Destino: {quant_destino['quantity']} -> {nuevo_stock_destino}")
-                    else:
-                        # Crear nuevo quant en destino
-                        quant_data = {
-                            'product_id': product_id,
-                            'location_id': ml['location_dest_id'][0],
-                            'lot_id': ml['lot_id'][0],
-                            'quantity': cantidad_consumida,
-                            'company_id': company_ids[0]
-                        }
-                        
-                        nuevo_quant = models.execute_kw(
-                            db, uid, password, 'stock.quant', 'create',
-                            [quant_data]
-                        )
-                        print(f" Nuevo quant creado en destino: {nuevo_quant}")
-                else:
-                    print("  Move line sin lote, omitiendo...")
-        else:
-            print(" No se encontraron move lines ejecutadas para este move")
-
-    #print("=== STOCK ACTUALIZADO PARA TODOS LOS PRODUCTOS CON LOTE ===")
-    print(f"Orden de producción {nombre} finalizada correctamente.")
-
-    pdb.set_trace() 
-
-    def actualizar_stock_backorder(production_id, company_ids):
-    #"""Actualiza stock.quant para una backorder específica"""
-        print(f"Backorder {id}: Actualizando stock.quant")
-        
-        # Buscar moves de materia prima con lotes
-        moves_con_lotes = models.execute_kw(
-            db, uid, password, 'stock.move', 'search_read',
-            [[
-                ['raw_material_production_id', '=', id],
-                ['needs_lots', '=', True]
-            ]],
-            {'fields': ['id', 'product_id', 'location_id', 'location_dest_id']}
-        )
-
-        for move in moves_con_lotes:
-            # Buscar move line ejecutada
-            move_lines = models.execute_kw(
-                db, uid, password, 'stock.move.line', 'search_read',
-                [[['move_id', '=', move['id']], ['qty_done', '>', 0]]],
-                {'fields': ['id', 'location_id', 'location_dest_id', 'lot_id', 'qty_done', 'product_id']}
-            )
-            
-            if move_lines:
-                ml = move_lines[0]
-                cantidad_consumida = ml['qty_done']
-                product_id = ml['product_id'][0]
-                
-                print(f" Producto: {ml['product_id'][1]}, Cantidad: {cantidad_consumida}")
-                
-                # Actualizar almacén de ORIGEN (disminuir)
-                domain_origen = [
-                    ['product_id', '=', product_id],
-                    ['location_id', '=', ml['location_id'][0]],
-                    ['lot_id', '=', ml['lot_id'][0]]
-                ]
-                
-                quants_origen = models.execute_kw(
-                    db, uid, password, 'stock.quant', 'search_read',
-                    [domain_origen],
-                    {'fields': ['id', 'quantity']}
-                )
-                
-                if quants_origen:
-                    quant_origen = quants_origen[0]
-                    nuevo_stock_origen = quant_origen['quantity'] - cantidad_consumida
-                    
-                    models.execute_kw(
-                        db, uid, password, 'stock.quant', 'write',
-                        [[quant_origen['id']], {
-                            'quantity': max(0, nuevo_stock_origen),
-                            'reserved_quantity': 0
-                        }]
-                    )
-                    print(f" Origen: {quant_origen['quantity']} -> {nuevo_stock_origen}")
-                
-                # Actualizar almacén de DESTINO (aumentar)
-                domain_destino = [
-                    ['product_id', '=', product_id],
-                    ['location_id', '=', ml['location_dest_id'][0]],
-                    ['lot_id', '=', ml['lot_id'][0]]
-                ]
-                
-                quants_destino = models.execute_kw(
-                    db, uid, password, 'stock.quant', 'search_read',
-                    [domain_destino],
-                    {'fields': ['id', 'quantity']}
-                )
-                
-                if quants_destino:
-                    quant_destino = quants_destino[0]
-                    nuevo_stock_destino = quant_destino['quantity'] + cantidad_consumida
-                    
-                    models.execute_kw(
-                        db, uid, password, 'stock.quant', 'write',
-                        [[quant_destino['id']], {
-                            'quantity': nuevo_stock_destino
-                        }]
-                    )
-                    print(f" Destino: {quant_destino['quantity']} -> {nuevo_stock_destino}")
-                else:
-                    # Crear nuevo quant en destino
-                    quant_data = {
-                        'product_id': product_id,
-                        'location_id': ml['location_dest_id'][0],
-                        'lot_id': ml['lot_id'][0],
-                        'quantity': cantidad_consumida,
-                        'company_id': company_ids[0]
-                    }
-                    
-                    nuevo_quant = models.execute_kw(
-                        db, uid, password, 'stock.quant', 'create',
-                        [quant_data]
-                    )
-                    print(f" Nuevo quant en destino: {nuevo_quant}")
-        
-        print(f" Stock actualizado para backorder {id}")
-
-    def sobreescribir_cantidades_backorder(production_id, lote_a_consumir, cantidad_real):
-        #"""Sobrescribe cantidades en moves y move lines de una backorder"""
-        print(f" Backorder {production_id}: Sobrescribiendo cantidades")
-        
-        # Buscar moves de la backorder
-        moves_backorder = models.execute_kw(
-            db, uid, password, 'stock.move', 'search_read',
-            [[['raw_material_production_id', '=', production_id]]],
-            {'fields': ['id', 'product_id', 'product_uom_qty', 'name']}
-        )
-
-        for move in moves_backorder:
-            # Buscar move lines que coincidan con el lote
-            move_lines = models.execute_kw(
-                db, uid, password, 'stock.move.line', 'search_read',
-                [[['move_id', '=', move['id']], ['lot_id', 'ilike', lote_a_consumir]]],
-                {'fields': ['id', 'product_uom_qty', 'qty_done', 'lot_id']}
-            )
-            
-            for ml in move_lines:
-                print(f" Move {move['id']}: {ml['product_uom_qty']} -> {cantidad_real}")
-                
-                # Sobrescribir move line
-                models.execute_kw(
-                    db, uid, password, 'stock.move.line', 'write',
-                    [[ml['id']], {
-                        'product_uom_qty': cantidad_real,
-                        'qty_done': cantidad_real
-                    }]
-                )
-                
-                # Sobrescribir move padre
-                models.execute_kw(
-                    db, uid, password, 'stock.move', 'write',
-                    [[move['id']], {
-                        'product_uom_qty': cantidad_real,
-                        'quantity_done': cantidad_real
-                    }]
-                )
-        
-        print(f" Cantidades actualizadas en backorder {production_id}")
-    
+    #pdb.set_trace() 
+   
     # Verificar cantidad antes de crear Backorder
     production_info = models.execute_kw(
         db, uid, password, 'mrp.production', 'read',
@@ -1560,7 +1549,15 @@ def main(data):
                             maquina, cargues, company_ids, TipodeActividad, lineas, indice_linea_actual):
             try:
                 fabricado_en_esta_iteracion = 0
-
+                
+                linea = lineas[indice_linea_actual[0]]
+                fecha_hora = datetime.fromisoformat(linea.get("Fecha Inicio"))
+                fecha_hora_fin = datetime.fromisoformat(linea.get("Fecha Fin"))
+                TipodeActividad = linea.get("Tipo de Actividad")
+                horahombre = float(linea.get("Hora Hombre", 0))
+                maquina = float(linea.get("Hora Maquina", 0))
+                cargues = float(linea.get("Hora Carga", 0))
+                
                 # Buscar todas las órdenes relacionadas (incluyendo la original y backorders)
                 nombre_base = nombre_original.split('-')[0]
                 ordenes_relacionadas = models.execute_kw(
@@ -1586,6 +1583,12 @@ def main(data):
                     #print(f"Iteración datos de linea:{linea}")
                     id_bo = bo['id']
                     cantidad_restante = cantidad_total - total_fabricado_actual - fabricado_en_esta_iteracion
+
+                    bo_info = models.execute_kw(db, uid, password, 'mrp.production', 'read', 
+                       [[id_bo]], {'fields': ['company_id']}
+                    )
+                    company_ids = bo_info[0]['company_id'][0] 
+
                     if index_bo < len(lineas):
                         linea_index = indice_linea_actual[0]                
                         if linea_index < len(lineas):
@@ -1632,8 +1635,24 @@ def main(data):
                                 'product_qty': Cantidad_fabricar_bo
                             }]
                         )
+                    # DEBUG: Ver qué se está buscando
+                    print(f" Company_ids='{company_ids}'")
+                    print(f" TipodeActividad='{TipodeActividad}'")
+                    print(f" Buscando loss con code='{TipodeActividad}'")
                     loss_ids_bo = models.execute_kw(db, uid, password, 'mrp.workcenter.productivity.loss', 'search_read',
-                                    [[['code', '=', TipodeActividad], ['company_id', '=', company_ids[0]]]],
+                        [[['code', '=', TipodeActividad]]],
+                        {'fields': ['id', 'name', 'code', 'company_id']}  # ← Agregar más campos para debug
+                    )
+                    print(f" Resultado: {loss_ids_bo}")
+
+                    if loss_ids_bo and len(loss_ids_bo) > 0:
+                        loss_id_bo = loss_ids_bo[0].get('id')
+                        print(f" Loss ID encontrado: {loss_id_bo}")
+                    else:
+                        print(" No se encontró loss con ese código")
+
+                    loss_ids_bo = models.execute_kw(db, uid, password, 'mrp.workcenter.productivity.loss', 'search_read',
+                                    [[['code', '=', TipodeActividad], ['company_id', '=', company_ids]]],
                                         {'fields': ['id']}
                                 )
                     loss_id_bo = loss_ids_bo[0].get('id')
@@ -1652,12 +1671,11 @@ def main(data):
                         'workcenter_id': workcenter_id,
                         'loss_id': loss_id_bo,
                         'account_date': hoy.isoformat(),
-                        'company_id': bo['company_id'][0] if isinstance(bo['company_id'], list) else bo['company_id'],
+                        'company_id': company_ids,  
                         'duration_labor': horahombre,
                         'duration_machine': maquina,
                         'duration_load': cargues,
                         'workorder_id': idOT_bo,
-                        #'user_id': 1007
                     }
                     id_productividad_bo=models.execute_kw(db, uid, password, 'mrp.workcenter.productivity', 'create', [productividad_bo])
 
@@ -1700,30 +1718,26 @@ def main(data):
                                         db, uid, password, 'stock.move.line', 'unlink',
                                         [move_lines]
                                     )
-
+                                
                                 num_lotes = (1)
                                 for i in range(num_lotes):
                                     lote_componente = linea.get("Lote a Consumir")
                                     cantidad_lote = float(linea.get("Cant. a Consumir", 0))
+                                    #lote_componente_id
                                     lote_componente_id = models.execute_kw(
                                         db, uid, password, 'stock.lot', 'search_read',
                                         [[('name', '=', lote_componente), ('product_id', '=', product_id)]],
                                         {'fields': ['id']}
                                     )
                                     if not lote_componente_id:
-                                        raise Exception(f"No se encontró el lote '{lote_componente}'")
+                                        raise Exception(f"LOTE NO EXISTE: No se encontró el lote '{lote_componente}'")
                                     lot_id = lote_componente_id[0]['id']
-                                    quant = models.execute_kw(
-                                        db, uid, password, 'stock.quant', 'search_read',
-                                        [[('product_id', '=', product_id), ('lot_id', '=', lot_id), ('quantity', '>', 0)]],
-                                        {'fields': ['location_id']}
-                                    )
-                                    if not quant:
-                                        raise Exception(f"No hay stock disponible para el lote '{lote_componente}' del producto {product_id}")
-                                    location_id = move['location_id'][0]
-                                    print(f"Usando location_id del move: {location_id} para el producto {product_id}")
 
-                                    # Crear una línea por lote
+                                    #Validación
+                                    location_id = move['location_id'][0]
+                                    validar_stock_suficiente(product_id, lot_id, cantidad_lote, location_id)
+
+                                    print(f"Usando location_id del move: {location_id} para el producto {product_id}")
                                     models.execute_kw(
                                         db, uid, password, 'stock.move.line', 'create',
                                         [{
@@ -1735,7 +1749,7 @@ def main(data):
                                             'location_id': location_id,
                                             'location_dest_id': location_dest_bo
                                         }]
-                                    )                                                
+                                    )
                         #print("Stock move lines actualizadas correctamente.")
                         move_lines = models.execute_kw(
                             db, uid, password, 'stock.move.line', 'search',
@@ -1757,7 +1771,7 @@ def main(data):
                         # Sobre escribir cantidades backorders
                         lote_a_consumir = linea.get("Lote a Consumir")
                         cantidad_real = float(linea.get("Cant. a Consumir", 0))
-                        sobreescribir_cantidades_backorder(id_bo, lote_a_consumir, cantidad_real)
+                        #sobreescribir_cantidades_backorder(id_bo, lote_a_consumir, cantidad_real)
 
                         # Finalizar la orden de producción
                         for move in component_moves_bo:
@@ -1767,12 +1781,7 @@ def main(data):
                                     [[move_id], {'state': 'done'}]
                                 )
                                 #print(f"Stock move {move_id} marcado como hecho.")
-                        id_cerrar_op = models.execute_kw(
-                                db, uid, password, 'mrp.production', 'button_mark_done',
-                                [[id_bo]]
-                            )
-                        # actualizar stock.quant en backorders
-                        actualizar_stock_backorder(id_bo, company_ids)
+                        finalizar_produccion_completa(id_bo, company_ids, Cantidad_fabricar_bo, bo.get('product_qty', 0), bo.get('name', 'Backorder'))
                         print(f"Orden de producción {nombre} finalizada correctamente. ")
 
                     except xmlrpc.client.Fault as e:
